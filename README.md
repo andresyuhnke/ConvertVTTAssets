@@ -395,6 +395,7 @@ MIT License - See LICENSE file for details
 
 Issues, suggestions, and pull requests are welcome at:
 - GitHub: https://github.com/andresyuhnke/ConvertVTTAssets
+- PowerShell Gallery: https://www.powershellgallery.com/packages/ConvertVTTAssets
 - Email: andres.yuhnke@gmail.com
 
 ## Acknowledgments

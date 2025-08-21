@@ -1,0 +1,301 @@
+TOPIC
+    about_ConvertVTTAssets
+
+SHORT DESCRIPTION
+    A PowerShell module that provides optimized media conversion and filename 
+    sanitization for Foundry Virtual Tabletop (VTT) assets, converting animated 
+    content to WebM, static images to WebP format, and ensuring web-safe filenames 
+    with 50-75% typical file size reduction.
+
+LONG DESCRIPTION
+    ConvertVTTAssets helps prepare media for Foundry Virtual Tabletop by balancing 
+    quality and file size while retaining transparency when present. The module uses 
+    FFmpeg for conversion and provides intelligent skip-logic to avoid re-encoding 
+    assets that have already been converted or are up-to-date.
+    
+    The module includes filename optimization to ensure all assets are compatible 
+    with web servers, removing problematic characters and standardizing naming 
+    conventions according to Foundry VTT guidelines.
+    
+    The module supports both sequential and parallel processing modes, with real-time 
+    progress reporting and comprehensive logging capabilities.
+
+PREREQUISITES
+    PowerShell Requirements:
+        - PowerShell 7.0+ for full functionality including parallel processing
+        - Windows PowerShell 5.1 minimum (sequential processing only)
+        - ThreadJob module (auto-loaded in PS7+)
+    
+    External Tools:
+        - FFmpeg and FFprobe must be installed and available in system PATH
+        - Download from: https://www.gyan.dev/ffmpeg/builds/
+        - Alternatively, specify paths using -FfmpegPath and -FfprobePath parameters
+    
+    System Requirements:
+        - Windows 10/11 or Windows Server 2016+
+        - 4GB RAM minimum, 8GB+ recommended for parallel processing
+        - Multi-core CPU recommended for optimal parallel performance
+        - Sufficient disk space for converted files (typically 40-50% of source size)
+
+FUNCTIONS
+    Optimize-FileNames
+        Sanitizes filenames and directory names for web server compatibility.
+        
+        Key Features:
+            - Removes spaces and problematic characters
+            - Handles metadata in brackets/parentheses
+            - Smart character replacement logic
+            - Directory renaming with path tracking
+            - Processes deepest directories first
+            - Comprehensive logging support
+        
+        Character Handling:
+            - Apostrophes (') are removed
+            - Brackets [], parentheses (), braces {} become dashes
+            - Colons (:) become dashes
+            - Ampersands (&) become underscores or 'and'
+            - Special characters (!@#$%^~`) are removed
+            - Spaces become underscores, dashes, or removed
+        
+        Common Parameters:
+            -Root <string>             Source directory path (required)
+            -RemoveMetadata            Remove content in brackets/parentheses
+            -SpaceReplacement <string> 'Underscore', 'Dash', or 'Remove'
+            -ExpandAmpersand           Replace & with 'and' instead of _
+            -PreserveCase              Keep original case (default: lowercase)
+            -LowercaseExtensions       Force extensions to lowercase
+            -NoRecurse                 Only process root directory
+            -Force                     Overwrite existing files
+            -LogPath <string>          Log file path (.csv or .json extension)
+            -Silent                    Suppress progress output
+            -WhatIf                    Preview changes without applying
+    
+    Convert-ToWebM
+        Converts animated images and videos to WebM format.
+        
+        Supported Input Formats:
+            .gif, .webp (animated), .mp4, .m4v, .mov, .mkv, .apng
+        
+        Key Features:
+            - VP9 (default) or AV1 codec support
+            - Automatic alpha channel preservation
+            - FPS capping for performance optimization
+            - Width limiting for file size control
+            - Audio stripping for smaller files
+            - CRF-based quality encoding
+        
+        Common Parameters:
+            -Root <string>             Source directory path
+            -OutputRoot <string>       Destination directory (mirrors structure)
+            -MaxFPS <int>              Cap framerate (default: 30)
+            -MaxWidth <int>            Maximum width in pixels (default: 1920)
+            -Codec <string>            'vp9' or 'av1' (default: vp9)
+            -AlphaMode <string>        'auto', 'force', or 'disable'
+            -Parallel                  Enable multi-threaded processing (PS7+)
+            -ThrottleLimit <int>       Simultaneous conversions (default: 4)
+            -Silent                    Suppress progress output
+            -Force                     Re-convert existing files
+            -DeleteSource              Move originals to Recycle Bin
+            -LogPath <string>          CSV/JSON log file path
+            -WhatIf                    Preview without converting
+    
+    Convert-ToWebP
+        Converts static images to WebP format.
+        
+        Supported Input Formats:
+            .png, .jpg, .jpeg, .tif, .tiff, .bmp
+        
+        Key Features:
+            - Lossy and lossless compression modes
+            - Automatic transparency preservation
+            - Quality control with adjustable compression
+            - Width limiting for file size control
+            - Batch processing with skip logic
+        
+        Common Parameters:
+            -Root <string>             Source directory path
+            -OutputRoot <string>       Destination directory (mirrors structure)
+            -Quality <int>             Compression quality 1-100 (default: 80)
+            -Lossless                  Use lossless compression
+            -MaxWidth <int>            Maximum width in pixels (default: 4096)
+            -Parallel                  Enable multi-threaded processing (PS7+)
+            -ThrottleLimit <int>       Simultaneous conversions (default: 4)
+            -Silent                    Suppress progress output
+            -Force                     Re-convert existing files
+            -DeleteSource              Move originals to Recycle Bin
+            -LogPath <string>          CSV/JSON log file path
+            -WhatIf                    Preview without converting
+
+RECOMMENDED WORKFLOW
+    For optimal Foundry VTT asset preparation, follow this three-step process:
+    
+    1. Sanitize Filenames:
+       Optimize-FileNames -Root "D:\FoundryAssets" -RemoveMetadata
+    
+    2. Convert Animated Content:
+       Convert-ToWebM -Root "D:\FoundryAssets" -OutputRoot "D:\Optimized" -Parallel
+    
+    3. Convert Static Images:
+       Convert-ToWebP -Root "D:\FoundryAssets" -OutputRoot "D:\Optimized" -Parallel
+
+PROGRESS OUTPUT
+    By default, the module displays real-time progress information:
+        [25%] Processing 1/4: animated_token.gif
+               ✓ Converted: animated_token.webm (Size reduction: -73.5%)
+               ⚠ Skipped: Already up-to-date
+               ✗ Failed: Error message
+    
+    For Optimize-FileNames:
+        [50%] Checking 5/10: [Dir] player's handbook
+               ✓ Renamed: player's handbook → players_handbook
+    
+    Use -Silent to suppress progress output and show only the summary.
+
+LOGGING
+    The -LogPath parameter creates detailed logs with format determined by file extension:
+        
+    File Extension Behavior:
+        .csv  → CSV format (tabular, Excel-compatible)
+        .json → JSON format (nested structure with full details)
+        other → Defaults to CSV format
+    
+    Examples:
+        -LogPath "D:\Logs\conversions.csv"     # Creates CSV log
+        -LogPath "D:\Logs\conversions.json"    # Creates JSON log
+        -LogPath "D:\Logs\conversions.log"     # Creates CSV log (default)
+        
+    For conversions:
+        - Timestamp for each conversion
+        - Source and destination paths
+        - Conversion status (Converted/Skipped/Failed)
+        - Processing duration
+        - File sizes before and after
+        - Size reduction percentage
+        - Codec and quality settings used
+        - Error messages for failures
+    
+    For filename optimization:
+        - Original and new paths
+        - Item type (File/Directory)
+        - Operation status
+        - Settings used
+        - Error details if failed
+
+EXAMPLES
+    # Complete asset optimization workflow
+    Optimize-FileNames -Root "D:\FoundryAssets" -RemoveMetadata -SpaceReplacement Underscore
+    Convert-ToWebM -Root "D:\FoundryAssets" -OutputRoot "D:\Optimized" -MaxFPS 24 -Parallel
+    Convert-ToWebP -Root "D:\FoundryAssets" -OutputRoot "D:\Optimized" -Quality 85 -Parallel
+    
+    # Sanitize filenames with custom settings
+    Optimize-FileNames `
+        -Root "D:\Maps" `
+        -RemoveMetadata `
+        -ExpandAmpersand `
+        -SpaceReplacement Dash `
+        -LogPath "D:\Logs\renamed_files.csv"
+    
+    # Preview filename changes without applying
+    Optimize-FileNames -Root "D:\Tokens" -RemoveMetadata -WhatIf
+    
+    # High-quality token conversion
+    Convert-ToWebP `
+        -Root "D:\Tokens" `
+        -OutputRoot "D:\Tokens-WebP" `
+        -Quality 90 `
+        -MaxWidth 512 `
+        -Parallel `
+        -Silent
+    
+    # Batch convert animated maps with cleanup
+    Convert-ToWebM `
+        -Root "D:\AnimatedMaps" `
+        -OutputRoot "E:\VTT-Optimized" `
+        -MaxFPS 24 `
+        -MaxWidth 2560 `
+        -DeleteSource `
+        -Force
+
+FILENAME TRANSFORMATION EXAMPLES
+    Default behavior:
+        "player's handbook.pdf" → "players_handbook.pdf"
+        "map [night time].png" → "map-night_time.png"
+        "token (v2).webp" → "token-v2.webp"
+        "maps & tokens/" → "maps_tokens/"
+        "file!!!.jpg" → "file.jpg"
+    
+    With -RemoveMetadata:
+        "map [night time].png" → "map.png"
+        "token (v2).webp" → "token.webp"
+        "file(30x25-gridless).jpg" → "file.jpg"
+    
+    With -ExpandAmpersand:
+        "maps & tokens/" → "maps_and_tokens/"
+        "D&D Campaign.txt" → "d_and_d_campaign.txt"
+    
+    With -SpaceReplacement Dash:
+        "my awesome map.png" → "my-awesome-map.png"
+    
+    With -PreserveCase:
+        "README.md" → "README.md" (instead of "readme.md")
+
+PERFORMANCE TIPS
+    1. Parallel Processing:
+       - Use -Parallel with PS7+ for 3-4x speed improvement
+       - Set -ThrottleLimit to (CPU cores - 2) for optimal performance
+       - Monitor system resources and adjust accordingly
+    
+    2. Optimal Settings by Asset Type:
+       Battle Maps:  -MaxWidth 2560 -MaxFPS 24 -Quality 80
+       Tokens:       -MaxWidth 512  -MaxFPS 30 -Quality 85
+       Portraits:    -MaxWidth 1024 -Quality 90
+       UI Elements:  -MaxWidth 512  -Quality 95
+    
+    3. File Organization:
+       - Run Optimize-FileNames first to ensure web compatibility
+       - Process similar files together for consistent settings
+       - Use -OutputRoot to keep originals intact
+       - Review logs before using -DeleteSource
+
+TROUBLESHOOTING
+    "ffmpeg not found":
+        Ensure FFmpeg is in PATH or use -FfmpegPath parameter
+    
+    "Cannot be loaded because running scripts is disabled":
+        Run: Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+    
+    Parallel not working:
+        Verify PowerShell 7+ with: $PSVersionTable.PSVersion
+    
+    Files not converting:
+        - Check file extensions match supported formats
+        - Verify files aren't corrupted with: ffprobe "path\to\file"
+        - Ensure write permissions on output directory
+        - Review log file for specific error messages
+    
+    Filename optimization issues:
+        - Use -WhatIf to preview changes first
+        - Some characters can't exist in Windows filenames
+        - Check -LogPath output for specific errors
+        - Directories are renamed before files to maintain paths
+
+NOTES
+    Authors: Andres Yuhnke, Claude (Anthropic), ChatGPT (OpenAI)
+    Version: 1.5.2
+    License: MIT
+    
+    This module was developed through collaboration between human developers and 
+    AI assistants, combining domain expertise in Foundry VTT optimization with 
+    advanced PowerShell module architecture and parallel processing implementation.
+    
+    Filename sanitization follows official Foundry VTT media guidelines:
+    https://foundryvtt.com/article/media/
+    
+    Special thanks to the FFmpeg team for providing the core conversion engine 
+    that makes this module possible.
+
+SEE ALSO
+    FFmpeg documentation: https://ffmpeg.org/documentation.html
+    Foundry VTT: https://foundryvtt.com/
+    Foundry VTT Media Guide: https://foundryvtt.com/article/media/
+    PowerShell 7: https://github.com/PowerShell/PowerShell

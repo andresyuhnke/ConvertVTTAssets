@@ -394,8 +394,8 @@ MIT License - See LICENSE file for details
 ## Contributing
 
 Issues, suggestions, and pull requests are welcome at:
-- GitHub: [your-repo-url]
-- Email: [your-email]
+- GitHub: https://github.com/andresyuhnke/ConvertVTTAssets
+- Email: andres.yuhnke@gmail.com
 
 ## Acknowledgments
 

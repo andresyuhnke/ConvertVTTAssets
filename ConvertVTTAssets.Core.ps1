@@ -20,27 +20,6 @@ function Invoke-WebMParallel {
 
         $job = Start-ThreadJob -ScriptBlock {
             param($f,$S)
-            # Import the full module with retry logic
-            $modulePath = 'C:\PowerShell-Scripts\ConvertVTTAssets\ConvertVTTAssets.psd1'
-            $imported = $false
-            for ($i = 0; $i -lt 3; $i++) {
-                try {
-                    if (Test-Path $modulePath) { 
-                        Import-Module $modulePath -Force -ErrorAction Stop
-                        # Verify a function exists
-                        if (Get-Command Get-DestinationPath -ErrorAction SilentlyContinue) {
-                            $imported = $true
-                            break
-                        }
-                    }
-                    Start-Sleep -Milliseconds 100
-                } catch {
-                    Start-Sleep -Milliseconds 100
-                }
-            }
-            if (-not $imported) {
-                throw "Failed to import module after 3 attempts"
-            }
             
             $VerbosePreference = $S.VerbosePreference
             $WhatIfPreference  = $S.WhatIfPreference
@@ -193,28 +172,7 @@ function Invoke-WebPParallel {
 
         $job = Start-ThreadJob -ScriptBlock {
             param($f,$S)
-            # Import the full module with retry logic
-            $modulePath = 'C:\PowerShell-Scripts\ConvertVTTAssets\ConvertVTTAssets.psd1'
-            $imported = $false
-            for ($i = 0; $i -lt 3; $i++) {
-                try {
-                    if (Test-Path $modulePath) { 
-                        Import-Module $modulePath -Force -ErrorAction Stop
-                        # Verify a function exists
-                        if (Get-Command Get-DestinationPath -ErrorAction SilentlyContinue) {
-                            $imported = $true
-                            break
-                        }
-                    }
-                    Start-Sleep -Milliseconds 100
-                } catch {
-                    Start-Sleep -Milliseconds 100
-                }
-            }
-            if (-not $imported) {
-                throw "Failed to import module after 3 attempts"
-            }
-            
+                        
             $VerbosePreference = $S.VerbosePreference
             $WhatIfPreference  = $S.WhatIfPreference
             $ErrorActionPreference = 'Stop'
@@ -305,3 +263,213 @@ function Invoke-WebPParallel {
     }
 }
 
+# Parallel helper for filename optimization
+
+function Invoke-FileNameOptimizationParallel {
+    param(
+        [System.IO.FileSystemInfo[]]$Files,  # Only files, directories handled sequentially
+        [hashtable]$Settings,
+        [hashtable]$RenamedPaths,
+        [ref]$OperationId
+    )
+    
+    Import-Module ThreadJob -ErrorAction SilentlyContinue
+    Write-Verbose "Engine: ThreadJob (Filename Optimization) | ThrottleLimit=$($Settings.ThrottleLimit)"
+    [System.Collections.ArrayList]$jobs = @()
+
+    foreach ($f in $Files) {
+        while ($jobs.Count -ge [int]$Settings.ThrottleLimit) {
+            if ($jobs.Count -gt 0) { Wait-Job -Job $jobs -Any | Out-Null }
+            $jobs = @($jobs | Where-Object { $_.State -eq 'Running' })
+        }
+
+        $job = Start-ThreadJob -ScriptBlock {
+            param($f, $Settings, $RenamedPaths, $OpId)
+                        
+            $VerbosePreference = $Settings.VerbosePreference
+            $WhatIfPreference = $Settings.WhatIfPreference
+            $ErrorActionPreference = 'Stop'
+
+            # Create the sanitization function within the job
+            function Get-SanitizedName {
+                param(
+                    [string]$Name,
+                    [string]$Extension = ""
+                )
+                
+                $newName = $Name
+                
+                if ($Settings.RemoveMetadata) {
+                    $newName = $newName -replace '\([^)]*\)', ''
+                    $newName = $newName -replace '\[[^\]]*\]', ''
+                    $newName = $newName -replace '_\d+x\d+', ''
+                    $newName = $newName -replace '-\d+x\d+', ''
+                    $newName = $newName -replace '__+', '_'
+                    $newName = $newName -replace '--+', '-'
+                    $newName = $newName -replace '[_-]+$', ''
+                    $newName = $newName -replace '^[_-]+', ''
+                }
+                
+                switch ($Settings.SpaceReplacement) {
+                    'Remove'     { $newName = $newName -replace '\s+', '' }
+                    'Dash'       { $newName = $newName -replace '\s+', '-' }
+                    'Underscore' { $newName = $newName -replace '\s+', '_' }
+                }
+                
+                if ($Settings.ExpandAmpersand) {
+                    $newName = $newName -replace '&', '_and_'
+                    $newName = $newName -replace '_and_+', '_and_'
+                } else {
+                    $newName = $newName -replace '&', '_'
+                }
+                
+                # Define problematic characters
+                $problematicChars = @(
+                    '*', '"', '[', ']', ':', ';', '|', ',', '&', '=', '+', '$', '?', '%', '#',
+                    '(', ')', '{', '}', '<', '>', '!', '@', '^', '~', '`', "'"
+                )
+                
+                foreach ($char in $problematicChars) {
+                    if ($char -ne '&') {
+                        $escaped = [Regex]::Escape($char)
+                        if ($char -in @('[',']','(',')')) {
+                            $newName = $newName -replace $escaped, '-'
+                        } else {
+                            $newName = $newName -replace $escaped, ''
+                        }
+                    }
+                }
+                
+                $newName = $newName -replace '_{2,}', '_'
+                $newName = $newName -replace '-{2,}', '-'
+                $newName = $newName -replace '\.{2,}', '.'
+                $newName = $newName -replace '^[_.-]+', ''
+                $newName = $newName -replace '[_.-]+$', ''
+                
+                if (-not $Settings.PreserveCase) {
+                    $newName = $newName.ToLower()
+                }
+                
+                $newExt = $Extension
+                if ($Settings.LowercaseExtensions -and $Extension) {
+                    $newExt = $Extension.ToLower()
+                }
+                
+                if ($Extension) {
+                    $finalName = "${newName}${newExt}"
+                } else {
+                    $finalName = $newName
+                }
+                
+                if ([string]::IsNullOrWhiteSpace($finalName)) {
+                    $finalName = "unnamed_$(Get-Random -Maximum 9999)"
+                    if ($Extension) { $finalName += $newExt }
+                }
+                
+                return $finalName
+            }
+
+            # Update file path based on renamed directories
+            $currentPath = $f.FullName
+            foreach ($oldPath in $RenamedPaths.Keys | Sort-Object -Property Length -Descending) {
+                if ($currentPath.StartsWith($oldPath)) {
+                    $currentPath = $currentPath.Replace($oldPath, $RenamedPaths[$oldPath])
+                    break
+                }
+            }
+            
+            # Skip if file no longer exists (parent was renamed)
+            if (-not (Test-Path -LiteralPath $currentPath)) {
+                return [PSCustomObject]@{
+                    OperationId = $OpId
+                    Type = "File"
+                    OriginalPath = $f.FullName
+                    OriginalName = $f.Name
+                    NewPath = $null
+                    NewName = $null
+                    Status = "Skipped"
+                    Error = "Parent directory was renamed"
+                    Time = (Get-Date).ToString('s')
+                    LastWriteTime = $null
+                    FileSize = $null
+                    ParentDirectory = $null
+                    Dependencies = @()
+                }
+            }
+            
+            $currentItem = Get-Item -LiteralPath $currentPath
+            $originalName = $currentItem.Name
+            $directory = $currentItem.DirectoryName
+            
+            $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($originalName)
+            $extension = [System.IO.Path]::GetExtension($originalName)
+            
+            $newName = Get-SanitizedName -Name $nameWithoutExt -Extension $extension
+            
+            # Create result object
+            $result = [PSCustomObject]@{
+                OperationId = $OpId
+                Type = "File"
+                OriginalPath = $currentPath
+                OriginalName = $originalName
+                NewPath = (Join-Path $directory $newName)
+                NewName = $newName
+                Status = "Skipped"
+                Error = ""
+                Time = (Get-Date).ToString('s')
+                LastWriteTime = $currentItem.LastWriteTimeUtc.ToString('o')
+                FileSize = $currentItem.Length
+                ParentDirectory = $directory
+                Dependencies = @()
+            }
+            
+            # Check if rename is needed
+            if ($newName -eq $originalName) {
+                $result.Status = "AlreadyOptimized"
+                return $result
+            }
+            
+            $newPath = Join-Path $directory $newName
+            $result.NewPath = $newPath
+            
+            # Check for conflicts
+            if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and -not $Settings.Force) {
+                $result.Status = "Skipped"
+                $result.Error = "Target already exists"
+                return $result
+            }
+            
+            # Perform rename operation
+            if ($WhatIfPreference) {
+                $result.Status = "WhatIf"
+                return $result
+            }
+            
+            try {
+                if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and $Settings.Force) {
+                    Remove-Item -LiteralPath $newPath -Force
+                }
+                
+                Rename-Item -LiteralPath $currentPath -NewName $newName -Force:$Settings.Force -ErrorAction Stop
+                $result.Status = "Success"
+                
+                return $result
+            } catch {
+                $result.Status = "Failed"
+                $result.Error = $_.Exception.Message
+                return $result
+            }
+        } -ArgumentList $f, $Settings, $RenamedPaths, $OperationId.Value
+        
+        $OperationId.Value++
+        $jobs += $job
+    }
+
+    if ($jobs.Count -gt 0) {
+        Wait-Job -Job $jobs | Out-Null
+        $results = Receive-Job -Job $jobs -AutoRemoveJob -Wait
+        return $results
+    } else {
+        return @()
+    }
+}

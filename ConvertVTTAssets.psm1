@@ -664,7 +664,11 @@ param(
     
     [switch]$PreserveCase,
     
+    [switch]$ExpandAmpersand,
+    
     [string]$LogPath,
+    
+    [string]$UndoLogPath,  # NEW: Dedicated undo log path
     
     [switch]$Silent,
     
@@ -676,17 +680,41 @@ if (-not (Test-Path -LiteralPath $Root)) {
     throw "Path not found: $Root"
 }
 
+# Generate automatic undo log path if not specified but LogPath is provided
+if (-not $UndoLogPath -and $LogPath) {
+    $logDir = [System.IO.Path]::GetDirectoryName($LogPath)
+    $logName = [System.IO.Path]::GetFileNameWithoutExtension($LogPath)
+    $UndoLogPath = Join-Path $logDir "${logName}_undo.json"
+}
+
 # Initialize collections
 $renameOperations = @()
 $errors = @()
 $skipped = @()
 $renamedPaths = @{} # Track renamed paths for child file updates
+$operationId = 0
 
 # Define problematic characters for web URIs
 $problematicChars = @(
     '*', '"', '[', ']', ':', ';', '|', ',', '&', '=', '+', '$', '?', '%', '#',
     '(', ')', '{', '}', '<', '>', '!', '@', '^', '~', '`', "'"
 )
+
+# Create undo log metadata
+$undoMetadata = @{
+    timestamp = (Get-Date).ToString('o')  # ISO 8601 format
+    root_path = (Resolve-Path -LiteralPath $Root).Path
+    settings = @{
+        RemoveMetadata = $RemoveMetadata.IsPresent
+        SpaceReplacement = $SpaceReplacement
+        LowercaseExtensions = $LowercaseExtensions.IsPresent
+        PreserveCase = $PreserveCase.IsPresent
+        ExpandAmpersand = $ExpandAmpersand.IsPresent
+        Force = $Force.IsPresent
+    }
+    powershell_version = $PSVersionTable.PSVersion.ToString()
+    module_version = (Get-Module ConvertVTTAssets).Version.ToString()
+}
 
 # Get all files and directories
 $recurse = -not $NoRecurse.IsPresent
@@ -730,10 +758,13 @@ if (-not $Silent -and $totalItems -gt 0) {
     Write-Host ""
     Write-Host "=== Optimize-FileNames Starting ===" -ForegroundColor Cyan
     Write-Host "Analyzing $totalItems item(s) for optimization..." -ForegroundColor Yellow
+    if ($UndoLogPath) {
+        Write-Host "Undo log will be created at: $UndoLogPath" -ForegroundColor DarkGray
+    }
     Write-Host ""
 }
 
-# Helper function to sanitize names
+# Helper function to sanitize names (unchanged)
 function Get-SanitizedName {
     param(
         [string]$Name,
@@ -762,25 +793,39 @@ function Get-SanitizedName {
         'Underscore' { $newName = $newName -replace '\s+', '_' }
     }
     
-    # Step 3: Remove or replace problematic characters
-    foreach ($char in $problematicChars) {
-        $escaped = [Regex]::Escape($char)
-        $newName = $newName -replace $escaped, '_'
+    # Step 3: Handle ampersands
+    if ($ExpandAmpersand) {
+        $newName = $newName -replace '&', '_and_'
+        $newName = $newName -replace '_and_+', '_and_'  # Clean up multiple and's
+    } else {
+        $newName = $newName -replace '&', '_'
     }
     
-    # Step 4: Clean up multiple separators
+    # Step 4: Remove or replace other problematic characters
+    foreach ($char in $problematicChars) {
+        if ($char -ne '&') {  # Already handled ampersands above
+            $escaped = [Regex]::Escape($char)
+            if ($char -in @('[',']','(',')')) {
+                $newName = $newName -replace $escaped, '-'
+            } else {
+                $newName = $newName -replace $escaped, ''
+            }
+        }
+    }
+    
+    # Step 5: Clean up multiple separators
     $newName = $newName -replace '_{2,}', '_'
     $newName = $newName -replace '-{2,}', '-'
     $newName = $newName -replace '\.{2,}', '.'
     $newName = $newName -replace '^[_.-]+', ''
     $newName = $newName -replace '[_.-]+$', ''
     
-    # Step 5: Handle case conversion
+    # Step 6: Handle case conversion
     if (-not $PreserveCase) {
         $newName = $newName.ToLower()
     }
     
-    # Step 6: Handle extension
+    # Step 7: Handle extension
     $newExt = $Extension
     if ($LowercaseExtensions -and $Extension) {
         $newExt = $Extension.ToLower()
@@ -805,6 +850,7 @@ function Get-SanitizedName {
 # Process each item
 foreach ($item in $itemsToProcess) {
     $itemNum++
+    $operationId++
     
     # Progress output
     if (-not $Silent) {
@@ -883,8 +929,14 @@ foreach ($item in $itemsToProcess) {
         continue
     }
     
-    # Create rename operation record
+    # Get file info for undo log
+    $fileInfo = Get-Item -LiteralPath $currentPath
+    $lastWriteTime = $fileInfo.LastWriteTimeUtc.ToString('o')
+    $fileSize = if ($isDirectory) { $null } else { $fileInfo.Length }
+    
+    # Create enhanced operation record with undo information
     $operation = [PSCustomObject]@{
+        # Standard operation log fields
         Time = (Get-Date).ToString('s')
         Type = if ($isDirectory) { "Directory" } else { "File" }
         OriginalPath = $currentPath
@@ -893,6 +945,13 @@ foreach ($item in $itemsToProcess) {
         NewName = $newName
         Status = "Pending"
         Error = ""
+        
+        # Enhanced undo log fields
+        OperationId = $operationId
+        ParentDirectory = $directory
+        LastWriteTime = $lastWriteTime
+        FileSize = $fileSize
+        Dependencies = @()  # Will be filled in later for directories
     }
     
     # Perform rename
@@ -937,7 +996,62 @@ foreach ($item in $itemsToProcess) {
     $renameOperations += $operation
 }
 
-# Write log if requested
+# Create comprehensive undo log
+if ($UndoLogPath -and $renameOperations.Count -gt 0) {
+    $successfulOps = $renameOperations | Where-Object { $_.Status -eq "Success" }
+    
+    if ($successfulOps.Count -gt 0) {
+        # Build dependency relationships for directories
+        foreach ($op in $successfulOps | Where-Object { $_.Type -eq "Directory" }) {
+            # Find all operations that occurred within this directory
+            $dependents = $successfulOps | Where-Object { 
+                $_.OperationId -ne $op.OperationId -and 
+                $_.OriginalPath.StartsWith($op.NewPath)  # Use new path since rename already happened
+            }
+            
+            $op.Dependencies = @($dependents | ForEach-Object { $_.OperationId })
+        }
+        
+# Add total operations to metadata before creating the hash
+        $undoMetadata.total_operations = $successfulOps.Count
+        
+        $undoLog = @{
+            metadata = $undoMetadata
+            operations = @($successfulOps | ForEach-Object {
+                @{
+                    operation_id = $_.OperationId
+                    type = $_.Type
+                    original_path = $_.OriginalPath
+                    new_path = $_.NewPath
+                    original_name = $_.OriginalName
+                    new_name = $_.NewName
+                    parent_directory = $_.ParentDirectory
+                    timestamp = $_.Time
+                    last_write_time = $_.LastWriteTime
+                    file_size = $_.FileSize
+                    dependencies = $_.Dependencies
+                }
+            })
+        }
+        
+        # Ensure directory exists
+        $undoLogDir = [System.IO.Path]::GetDirectoryName($UndoLogPath)
+        if ($undoLogDir -and -not (Test-Path $undoLogDir)) {
+            New-Item -ItemType Directory -Force -Path $undoLogDir | Out-Null
+        }
+        
+        # Write undo log
+        $undoLog | ConvertTo-Json -Depth 10 | Set-Content -Path $UndoLogPath -Encoding UTF8
+        
+        if (-not $Silent) {
+            Write-Host ""
+            Write-Host "Undo log created: $UndoLogPath" -ForegroundColor Green
+            Write-Host "  Operations logged: $($successfulOps.Count)" -ForegroundColor DarkGray
+        }
+    }
+}
+
+# Write standard log if requested
 if ($LogPath) {
     $dir = [System.IO.Path]::GetDirectoryName($LogPath)
     if ($dir -and -not (Test-Path $dir)) {
@@ -955,6 +1069,7 @@ if ($LogPath) {
             RemoveMetadata = $RemoveMetadata
             LowercaseExtensions = $LowercaseExtensions
             PreserveCase = $PreserveCase
+            ExpandAmpersand = $ExpandAmpersand
         }
     }
     
@@ -982,7 +1097,7 @@ if ($errors.Count -gt 0) {
     Write-Host ""
     Write-Host "Errors encountered:" -ForegroundColor Red
     foreach ($err in $errors) {
-    Write-Host "  - $($err.OriginalName): $($err.Error)" -ForegroundColor Red
+        Write-Host "  - $($err.OriginalName): $($err.Error)" -ForegroundColor Red
     }
 }
 
@@ -994,8 +1109,331 @@ return [PSCustomObject]@{
     Failed = $failed
     WhatIf = $whatif
     Operations = $renameOperations
+    UndoLogPath = $UndoLogPath
 }
 }
 
-Export-ModuleMember -Function Convert-ToWebM, Convert-ToWebP, Optimize-FileNames
+function Undo-FileNameOptimization {
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$UndoLogPath,
+    
+    [switch]$Force,
+    
+    [switch]$Silent,
+    
+    [string]$BackupUndoLogPath  # Create backup of undo log before processing
+)
+
+# Validate undo log exists
+if (-not (Test-Path -LiteralPath $UndoLogPath)) {
+    throw "Undo log not found: $UndoLogPath"
+}
+
+# Read and validate undo log
+try {
+    $undoLogContent = Get-Content -LiteralPath $UndoLogPath -Raw -Encoding UTF8
+    $undoLog = $undoLogContent | ConvertFrom-Json
+} catch {
+    throw "Failed to read or parse undo log: $($_.Exception.Message)"
+}
+
+# Validate undo log structure
+if (-not $undoLog.metadata -or -not $undoLog.operations) {
+    throw "Invalid undo log format. Missing required 'metadata' or 'operations' sections."
+}
+
+if (-not $undoLog.operations -or $undoLog.operations.Count -eq 0) {
+    Write-Warning "Undo log contains no operations to reverse."
+    return
+}
+
+# Create backup of undo log if requested
+if ($BackupUndoLogPath) {
+    $backupDir = [System.IO.Path]::GetDirectoryName($BackupUndoLogPath)
+    if ($backupDir -and -not (Test-Path $backupDir)) {
+        New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+    }
+    
+    Copy-Item -LiteralPath $UndoLogPath -Destination $BackupUndoLogPath -Force
+    if (-not $Silent) {
+        Write-Host "Undo log backed up to: $BackupUndoLogPath" -ForegroundColor DarkGray
+    }
+}
+
+# Initialize collections
+$undoOperations = @()
+$errors = @()
+$warnings = @()
+$skipped = @()
+
+# Get operations and sort them for proper undo order
+# Directories with dependencies must be undone after their children
+$operations = $undoLog.operations
+
+# Sort operations: files first, then directories by dependency depth (deepest first)
+$fileOps = $operations | Where-Object { $_.type -eq "File" }
+$dirOps = $operations | Where-Object { $_.type -eq "Directory" }
+
+# Sort directories by dependency count (most dependencies = deepest = undo last)
+$sortedDirOps = $dirOps | Sort-Object { $_.dependencies.Count } -Descending
+
+# Combine: files first, then directories in reverse dependency order
+$sortedOperations = @($fileOps) + @($sortedDirOps)
+
+# Initialize progress
+$totalOps = $sortedOperations.Count
+$opNum = 0
+
+if (-not $Silent) {
+    Write-Host ""
+    Write-Host "=== Undo-FileNameOptimization Starting ===" -ForegroundColor Cyan
+    Write-Host "Original optimization: $($undoLog.metadata.timestamp)" -ForegroundColor DarkGray
+    Write-Host "Root path: $($undoLog.metadata.root_path)" -ForegroundColor DarkGray
+    Write-Host "Operations to undo: $totalOps" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+# Validation pass: check current state before making any changes
+if (-not $Silent) {
+    Write-Host "Validating current state..." -ForegroundColor Yellow
+}
+
+$validationErrors = @()
+$currentPathMap = @{}  # Track current state
+
+foreach ($op in $sortedOperations) {
+    $opNum++
+    
+    # Progress for validation
+    if (-not $Silent) {
+        $percentComplete = [math]::Round(($opNum / $totalOps) * 50, 0)  # Validation is first 50%
+        Write-Host ("[{0,3}%] Validating {1}/{2}: {3}" -f $percentComplete, $opNum, $totalOps, $op.new_name) -ForegroundColor Cyan
+    }
+    
+    # Check if the "new" file/directory still exists at expected location
+    if (-not (Test-Path -LiteralPath $op.new_path)) {
+        $validationErrors += "Missing renamed item: $($op.new_path)"
+        continue
+    }
+    
+    # Get current file info
+    $currentItem = Get-Item -LiteralPath $op.new_path
+    
+    # For files, validate they haven't been modified
+    if ($op.type -eq "File" -and $op.file_size -ne $null) {
+        if ($currentItem.Length -ne $op.file_size) {
+            $validationErrors += "File size changed: $($op.new_path) (was $($op.file_size), now $($currentItem.Length))"
+        }
+        
+        # Check if last write time is significantly different (allow for small clock differences)
+        $originalTime = [DateTime]::Parse($op.last_write_time)
+        $timeDiff = [Math]::Abs(($currentItem.LastWriteTimeUtc - $originalTime).TotalSeconds)
+        if ($timeDiff -gt 2) {  # Allow 2 second difference for file system precision
+            $warnings += "File modified since optimization: $($op.new_path)"
+        }
+    }
+    
+    # Check if original name would cause conflicts
+    if ((Test-Path -LiteralPath $op.original_path) -and -not $Force) {
+        $validationErrors += "Original name already exists: $($op.original_path) (use -Force to overwrite)"
+    }
+    
+    # Track current state for dependency validation
+    $currentPathMap[$op.new_path] = $op
+}
+
+# Report validation results
+if ($validationErrors.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Validation failed with $($validationErrors.Count) error(s):" -ForegroundColor Red
+    foreach ($err in $validationErrors) {
+        Write-Host "  ✗ $err" -ForegroundColor Red
+    }
+    
+    if (-not $Force) {
+        Write-Host ""
+        Write-Host "Use -Force to attempt undo despite validation errors, or fix the issues above." -ForegroundColor Yellow
+        return
+    } else {
+        Write-Host ""
+        Write-Host "-Force specified, continuing despite validation errors..." -ForegroundColor Yellow
+    }
+}
+
+if ($warnings.Count -gt 0 -and -not $Silent) {
+    Write-Host ""
+    Write-Host "Validation warnings:" -ForegroundColor Yellow
+    foreach ($warn in $warnings) {
+        Write-Host "  ⚠ $warn" -ForegroundColor Yellow
+    }
+}
+
+if (-not $Silent) {
+    Write-Host ""
+    Write-Host "Validation complete. Beginning undo operations..." -ForegroundColor Green
+    Write-Host ""
+}
+
+# Reset progress counter for undo operations
+$opNum = 0
+
+# Perform undo operations
+foreach ($op in $sortedOperations) {
+    $opNum++
+    
+    # Progress for undo operations
+    if (-not $Silent) {
+        $percentComplete = [math]::Round(50 + ($opNum / $totalOps) * 50, 0)  # Undo is second 50%
+        Write-Host ("[{0,3}%] Undoing {1}/{2}: {3} → {4}" -f $percentComplete, $opNum, $totalOps, $op.new_name, $op.original_name) -ForegroundColor Cyan
+    }
+    
+    # Create undo operation record
+    $undoResult = [PSCustomObject]@{
+        OperationId = $op.operation_id
+        Type = $op.type
+        CurrentPath = $op.new_path
+        TargetPath = $op.original_path
+        CurrentName = $op.new_name
+        TargetName = $op.original_name
+        Status = "Pending"
+        Error = ""
+        Timestamp = (Get-Date).ToString('s')
+    }
+    
+    try {
+        # Check if current path still exists
+        if (-not (Test-Path -LiteralPath $op.new_path)) {
+            $undoResult.Status = "Skipped"
+            $undoResult.Error = "Source no longer exists"
+            $skipped += $undoResult
+            
+            if (-not $Silent) {
+                Write-Host "       ⚠ Skipped: Source no longer exists" -ForegroundColor Yellow
+            }
+            continue
+        }
+        
+        # Check for target conflicts
+        if ((Test-Path -LiteralPath $op.original_path)) {
+            if ($Force) {
+                if (-not $Silent) {
+                    Write-Host "       ⚠ Overwriting existing file: $($op.original_name)" -ForegroundColor Yellow
+                }
+                Remove-Item -LiteralPath $op.original_path -Force -Recurse:($op.type -eq "Directory")
+            } else {
+                $undoResult.Status = "Skipped"
+                $undoResult.Error = "Target already exists (use -Force to overwrite)"
+                $skipped += $undoResult
+                
+                if (-not $Silent) {
+                    Write-Host "       ⚠ Skipped: Target already exists" -ForegroundColor Yellow
+                }
+                continue
+            }
+        }
+        
+        # Perform the undo rename
+        if ($PSCmdlet.ShouldProcess($op.new_path, "Undo rename to $($op.original_name)")) {
+            # Get the target directory
+            $targetDir = [System.IO.Path]::GetDirectoryName($op.original_path)
+            
+            # Ensure target directory exists
+            if (-not (Test-Path $targetDir)) {
+                New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+            }
+            
+            # Perform the rename
+            Rename-Item -LiteralPath $op.new_path -NewName $op.original_name -Force:$Force -ErrorAction Stop
+            
+            $undoResult.Status = "Success"
+            
+            if (-not $Silent) {
+                Write-Host "       ✓ Restored: $($op.new_name) → $($op.original_name)" -ForegroundColor Green
+            }
+        } else {
+            $undoResult.Status = "WhatIf"
+            if (-not $Silent) {
+                Write-Host "       → Would restore: $($op.new_name) → $($op.original_name)" -ForegroundColor Cyan
+            }
+        }
+        
+    } catch {
+        $undoResult.Status = "Failed"
+        $undoResult.Error = $_.Exception.Message
+        $errors += $undoResult
+        
+        if (-not $Silent) {
+            Write-Host "       ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    
+    $undoOperations += $undoResult
+}
+
+# Generate summary
+$successful = ($undoOperations | Where-Object { $_.Status -eq "Success" }).Count
+$failed = ($undoOperations | Where-Object { $_.Status -eq "Failed" }).Count
+$whatif = ($undoOperations | Where-Object { $_.Status -eq "WhatIf" }).Count
+$skippedCount = ($undoOperations | Where-Object { $_.Status -eq "Skipped" }).Count
+
+if (-not $Silent) { Write-Host "" }
+Write-Host "=== Undo-FileNameOptimization Summary ===" -ForegroundColor Cyan
+Write-Host "Restored: $successful" -ForegroundColor Green
+Write-Host "Skipped:  $skippedCount" -ForegroundColor Yellow
+if ($whatif -gt 0) { Write-Host "WhatIf:   $whatif" -ForegroundColor Cyan }
+if ($failed -gt 0) { Write-Host "Failed:   $failed" -ForegroundColor Red }
+
+if ($errors.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Errors encountered:" -ForegroundColor Red
+    foreach ($err in $errors) {
+        Write-Host "  - Operation $($err.OperationId): $($err.Error)" -ForegroundColor Red
+    }
+}
+
+# Create undo operation log
+$undoLogDir = [System.IO.Path]::GetDirectoryName($UndoLogPath)
+$undoLogName = [System.IO.Path]::GetFileNameWithoutExtension($UndoLogPath)
+$undoOpLogPath = Join-Path $undoLogDir "${undoLogName}_undo_operations.json"
+
+$undoOpLog = @{
+    metadata = @{
+        timestamp = (Get-Date).ToString('o')
+        original_undo_log = $UndoLogPath
+        original_optimization_timestamp = $undoLog.metadata.timestamp
+        total_undo_operations = $undoOperations.Count
+        successful_undos = $successful
+        powershell_version = $PSVersionTable.PSVersion.ToString()
+        module_version = (Get-Module ConvertVTTAssets).Version.ToString()
+    }
+    operations = $undoOperations
+    validation_errors = $validationErrors
+    warnings = $warnings
+}
+
+$undoOpLog | ConvertTo-Json -Depth 10 | Set-Content -Path $undoOpLogPath -Encoding UTF8
+
+if (-not $Silent) {
+    Write-Host ""
+    Write-Host "Undo operations logged to: $undoOpLogPath" -ForegroundColor Green
+}
+
+# Return summary object
+return [PSCustomObject]@{
+    TotalOperations = $totalOps
+    Restored = $successful
+    Skipped = $skippedCount
+    Failed = $failed
+    WhatIf = $whatif
+    ValidationErrors = $validationErrors.Count
+    Warnings = $warnings.Count
+    UndoOperations = $undoOperations
+    UndoLogPath = $undoOpLogPath
+}
+}
+
+# Export all functions
+Export-ModuleMember -Function Convert-ToWebM, Convert-ToWebP, Optimize-FileNames, Undo-FileNameOptimization
 

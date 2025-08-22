@@ -174,6 +174,397 @@ function Format-Bytes {
     return ('{0:N2} {1}' -f $val, $sizes[$i])
 }
 
+# Report Generation Helper Functions
+# Add these to the #region ===== Shared Helpers ===== section
+
+function Get-TimeEstimate {
+    param(
+        [int]$FileCount,
+        [long]$TotalSize,
+        [string]$OperationType = "FileNameOptimization"
+    )
+    
+    # Base time estimates per operation type (in seconds)
+    $baseTimePerFile = switch ($OperationType) {
+        "FileNameOptimization" { 0.1 }    # Very fast
+        "WebMConversion" { 15.0 }          # Depends on file size/complexity
+        "WebPConversion" { 3.0 }           # Faster than WebM
+        default { 1.0 }
+    }
+    
+    # Size-based adjustments for conversions
+    if ($OperationType -in @("WebMConversion", "WebPConversion") -and $TotalSize -gt 0) {
+        $avgFileSizeMB = ($TotalSize / $FileCount) / 1MB
+        if ($avgFileSizeMB -gt 10) { $baseTimePerFile *= 2 }
+        elseif ($avgFileSizeMB -gt 50) { $baseTimePerFile *= 4 }
+    }
+    
+    $totalSeconds = $FileCount * $baseTimePerFile
+    
+    # Return human-readable time estimate
+    if ($totalSeconds -lt 60) {
+        return "$([math]::Round($totalSeconds, 1)) seconds"
+    } elseif ($totalSeconds -lt 3600) {
+        return "$([math]::Round($totalSeconds / 60, 1)) minutes" 
+    } else {
+        return "$([math]::Round($totalSeconds / 3600, 1)) hours"
+    }
+}
+
+function Get-FileSizeProjection {
+    param(
+        [System.IO.FileInfo[]]$Files,
+        [string]$ConversionType,
+        [hashtable]$Settings = @{}
+    )
+    
+    $totalCurrentSize = ($Files | Measure-Object -Property Length -Sum).Sum
+    
+    # Rough compression estimates based on typical results
+    $compressionRatio = switch ($ConversionType) {
+        "WebM" { 0.35 }      # ~65% reduction
+        "WebP" { 
+            if ($Settings.Lossless) { 0.8 } else { 0.25 }  # Lossless keeps more, lossy compresses well
+        }
+        default { 1.0 }      # No change for filename optimization
+    }
+    
+    $projectedSize = [long]($totalCurrentSize * $compressionRatio)
+    $savings = $totalCurrentSize - $projectedSize
+    $savingsPercent = if ($totalCurrentSize -gt 0) { 
+        [math]::Round((1 - $compressionRatio) * 100, 1) 
+    } else { 0 }
+    
+    return @{
+        CurrentSize = $totalCurrentSize
+        ProjectedSize = $projectedSize
+        SavingsBytes = $savings
+        SavingsPercent = $savingsPercent
+        CurrentSizeFormatted = Format-Bytes $totalCurrentSize
+        ProjectedSizeFormatted = Format-Bytes $projectedSize
+        SavingsFormatted = Format-Bytes $savings
+    }
+}
+
+function New-HTMLReport {
+    param(
+        [string]$Title,
+        [string]$Operation,
+        [hashtable]$Summary,
+        [array]$DetailedItems,
+        [array]$Warnings = @(),
+        [hashtable]$Settings,
+        [string]$OutputPath
+    )
+    
+    # Generate HTML report content
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$Title</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+            border-left: 4px solid #3498db;
+            padding-left: 15px;
+        }
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .summary-card {
+            background: #ecf0f1;
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+        }
+        .summary-card h3 {
+            margin: 0 0 10px 0;
+            color: #2c3e50;
+            font-size: 1.1em;
+        }
+        .summary-card .value {
+            font-size: 1.8em;
+            font-weight: bold;
+            color: #27ae60;
+        }
+        .warning {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 5px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        .warning-title {
+            font-weight: bold;
+            color: #856404;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }
+        th {
+            background-color: #3498db;
+            color: white;
+            font-weight: bold;
+        }
+        tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+        .before {
+            background-color: #ffebee;
+            font-family: monospace;
+        }
+        .after {
+            background-color: #e8f5e8;
+            font-family: monospace;
+            font-weight: bold;
+        }
+        .no-change {
+            background-color: #f5f5f5;
+            color: #666;
+            font-style: italic;
+        }
+        .settings {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .settings h3 {
+            margin-top: 0;
+            color: #495057;
+        }
+        .footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #dee2e6;
+            color: #6c757d;
+            font-size: 0.9em;
+        }
+        .risk-high { border-left-color: #e74c3c !important; }
+        .risk-medium { border-left-color: #f39c12 !important; }
+        .risk-low { border-left-color: #27ae60 !important; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>$Title</h1>
+        <p><strong>Operation:</strong> $Operation</p>
+        <p><strong>Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+        
+        <h2>📊 Summary</h2>
+        <div class="summary">
+"@
+
+    # Add summary cards
+    foreach ($key in $Summary.Keys) {
+        $value = $Summary[$key]
+        $html += @"
+            <div class="summary-card">
+                <h3>$key</h3>
+                <div class="value">$value</div>
+            </div>
+"@
+    }
+    
+    $html += @"
+        </div>
+"@
+
+    # Add warnings section if present
+    if ($Warnings.Count -gt 0) {
+        $html += @"
+        <h2>⚠️ Warnings & Potential Issues</h2>
+"@
+        foreach ($warning in $Warnings) {
+            $riskClass = switch ($warning.Level) {
+                "High" { "risk-high" }
+                "Medium" { "risk-medium" }
+                default { "risk-low" }
+            }
+            
+            $html += @"
+        <div class="warning $riskClass">
+            <div class="warning-title">$($warning.Title)</div>
+            <div>$($warning.Description)</div>
+        </div>
+"@
+        }
+    }
+
+    # Add detailed items table
+    if ($DetailedItems.Count -gt 0) {
+        $html += @"
+        <h2>📋 Detailed Changes</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Type</th>
+                    <th>Current Path</th>
+                    <th>Before</th>
+                    <th>After</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+"@
+        
+        foreach ($item in $DetailedItems) {
+            $beforeName = if ($item.Before) { $item.Before } else { $item.Current }
+            $afterName = if ($item.After) { $item.After } else { $item.Current }
+            $status = if ($beforeName -eq $afterName) { "No Change" } else { "Will Change" }
+            
+            $beforeClass = if ($beforeName -eq $afterName) { "no-change" } else { "before" }
+            $afterClass = if ($beforeName -eq $afterName) { "no-change" } else { "after" }
+            
+            $html += @"
+                <tr>
+                    <td>$($item.Type)</td>
+                    <td><small>$($item.Path)</small></td>
+                    <td class="$beforeClass">$beforeName</td>
+                    <td class="$afterClass">$afterName</td>
+                    <td>$status</td>
+                </tr>
+"@
+        }
+        
+        $html += @"
+            </tbody>
+        </table>
+"@
+    }
+
+    # Add settings section
+    $html += @"
+        <h2>⚙️ Operation Settings</h2>
+        <div class="settings">
+            <h3>Configuration Used</h3>
+"@
+    
+    foreach ($key in $Settings.Keys) {
+        $value = $Settings[$key]
+        $html += "<p><strong>${key}:</strong> $value</p>"
+    }
+    
+    $html += @"
+        </div>
+        
+        <div class="footer">
+            <p>Report generated by ConvertVTTAssets v1.6.0 | <a href="https://www.powershellgallery.com/packages/ConvertVTTAssets">PowerShell Gallery</a></p>
+            <p>This is a preview report. No files have been modified. Use the actual command without -GenerateReport to apply changes.</p>
+        </div>
+    </div>
+</body>
+</html>
+"@
+
+    # Write HTML file
+    $html | Set-Content -Path $OutputPath -Encoding UTF8
+    
+    return $OutputPath
+}
+
+function Get-OperationWarnings {
+    param(
+        [array]$Items,
+        [string]$OperationType,
+        [hashtable]$Settings
+    )
+    
+    $warnings = @()
+    
+    switch ($OperationType) {
+        "FileNameOptimization" {
+            # Check for potential conflicts
+            $conflicts = @()
+            $proposedNames = @{}
+            
+            foreach ($item in $Items) {
+                if ($item.After -and $item.After -ne $item.Before) {
+                    $targetPath = Join-Path (Split-Path $item.Path -Parent) $item.After
+                    if ($proposedNames.ContainsKey($targetPath.ToLower())) {
+                        $conflicts += $targetPath
+                    }
+                    $proposedNames[$targetPath.ToLower()] = $true
+                }
+            }
+            
+            if ($conflicts.Count -gt 0) {
+                $warnings += @{
+                    Level = "High"
+                    Title = "Name Conflicts Detected"
+                    Description = "$($conflicts.Count) files would result in naming conflicts. Use -Force to overwrite or rename manually."
+                }
+            }
+            
+            # Check for directory dependencies
+            $directoryCount = ($Items | Where-Object { $_.Type -eq "Directory" }).Count
+            if ($directoryCount -gt 0) {
+                $warnings += @{
+                    Level = "Low"
+                    Title = "Directory Renaming"
+                    Description = "$directoryCount directories will be renamed. Files within them will be moved automatically."
+                }
+            }
+        }
+        
+        "WebMConversion" {
+            if (-not (Get-Command "ffmpeg" -ErrorAction SilentlyContinue)) {
+                $warnings += @{
+                    Level = "High"
+                    Title = "FFmpeg Not Found"
+                    Description = "FFmpeg is required for WebM conversion but was not found in PATH. Install FFmpeg before proceeding."
+                }
+            }
+            
+            $largeFiles = $Items | Where-Object { $_.Size -gt 100MB }
+            if ($largeFiles.Count -gt 0) {
+                $warnings += @{
+                    Level = "Medium"
+                    Title = "Large Files Detected"
+                    Description = "$($largeFiles.Count) files are larger than 100MB. Conversion may take significant time."
+                }
+            }
+        }
+    }
+    
+    return $warnings
+}
+
 #endregion ===== Shared Helpers =====
 
 function Convert-ToWebM {
@@ -668,11 +1059,19 @@ param(
     
     [string]$LogPath,
     
-    [string]$UndoLogPath,  # NEW: Dedicated undo log path
+    [string]$UndoLogPath,
     
     [switch]$Silent,
     
-    [switch]$Force
+    [switch]$Force,
+    
+    # NEW: Report generation parameters
+    [switch]$GenerateReport,
+    
+    [string]$ReportPath,
+    
+    [ValidateSet('HTML','CSV','JSON')]
+    [string]$ReportFormat = 'HTML'
 )
 
 # Validate root path exists
@@ -680,18 +1079,23 @@ if (-not (Test-Path -LiteralPath $Root)) {
     throw "Path not found: $Root"
 }
 
-# Generate automatic undo log path if not specified but LogPath is provided
+# Generate automatic paths if not specified
 if (-not $UndoLogPath -and $LogPath) {
     $logDir = [System.IO.Path]::GetDirectoryName($LogPath)
     $logName = [System.IO.Path]::GetFileNameWithoutExtension($LogPath)
     $UndoLogPath = Join-Path $logDir "${logName}_undo.json"
 }
 
+if ($GenerateReport -and -not $ReportPath) {
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $ReportPath = "ConvertVTTAssets_FilenameOptimization_Report_$timestamp.html"
+}
+
 # Initialize collections
 $renameOperations = @()
 $errors = @()
 $skipped = @()
-$renamedPaths = @{} # Track renamed paths for child file updates
+$renamedPaths = @{} 
 $operationId = 0
 
 # Define problematic characters for web URIs
@@ -700,27 +1104,23 @@ $problematicChars = @(
     '(', ')', '{', '}', '<', '>', '!', '@', '^', '~', '`', "'"
 )
 
-# Create undo log metadata
-$undoMetadata = @{
-    timestamp = (Get-Date).ToString('o')  # ISO 8601 format
-    root_path = (Resolve-Path -LiteralPath $Root).Path
-    settings = @{
-        RemoveMetadata = $RemoveMetadata.IsPresent
-        SpaceReplacement = $SpaceReplacement
-        LowercaseExtensions = $LowercaseExtensions.IsPresent
-        PreserveCase = $PreserveCase.IsPresent
-        ExpandAmpersand = $ExpandAmpersand.IsPresent
-        Force = $Force.IsPresent
-    }
-    powershell_version = $PSVersionTable.PSVersion.ToString()
-    module_version = (Get-Module ConvertVTTAssets).Version.ToString()
+# Create settings object for reporting
+$operationSettings = @{
+    "Root Path" = $Root
+    "Remove Metadata" = $RemoveMetadata.IsPresent
+    "Space Replacement" = $SpaceReplacement
+    "Lowercase Extensions" = $LowercaseExtensions.IsPresent
+    "Preserve Case" = $PreserveCase.IsPresent
+    "Expand Ampersand" = $ExpandAmpersand.IsPresent
+    "Force Overwrite" = $Force.IsPresent
+    "Recursive" = (-not $NoRecurse.IsPresent)
 }
 
 # Get all files and directories
 $recurse = -not $NoRecurse.IsPresent
 $allItems = Get-ChildItem -LiteralPath $Root -Recurse:$recurse
 
-# Filter by extension if specified (for files only)
+# Filter by extension if specified
 if ($IncludeExt -or $ExcludeExt) {
     $includeSet = if ($IncludeExt) { 
         [System.Collections.Generic.HashSet[string]]::new([string[]]($IncludeExt | ForEach-Object { $_.ToLower() }))
@@ -735,7 +1135,7 @@ if ($IncludeExt -or $ExcludeExt) {
     }
     
     $allItems = $allItems | Where-Object {
-        if ($_.PSIsContainer) { return $true } # Always include directories
+        if ($_.PSIsContainer) { return $true }
         $ext = [System.IO.Path]::GetExtension($_.Name).ToLower()
         $include = if ($includeSet) { $includeSet.Contains($ext) } else { $true }
         $exclude = if ($excludeSet) { $excludeSet.Contains($ext) } else { $false }
@@ -743,11 +1143,9 @@ if ($IncludeExt -or $ExcludeExt) {
     }
 }
 
-# Sort items - directories first (deepest first for renaming), then files
+# Sort items
 $directories = $allItems | Where-Object { $_.PSIsContainer } | Sort-Object { $_.FullName.Split('\').Count } -Descending
 $files = $allItems | Where-Object { -not $_.PSIsContainer } | Sort-Object FullName
-
-# Process directories first, then files
 $itemsToProcess = @($directories) + @($files)
 
 # Initialize progress
@@ -756,54 +1154,54 @@ $itemNum = 0
 
 if (-not $Silent -and $totalItems -gt 0) {
     Write-Host ""
-    Write-Host "=== Optimize-FileNames Starting ===" -ForegroundColor Cyan
-    Write-Host "Analyzing $totalItems item(s) for optimization..." -ForegroundColor Yellow
-    if ($UndoLogPath) {
-        Write-Host "Undo log will be created at: $UndoLogPath" -ForegroundColor DarkGray
+    if ($GenerateReport) {
+        Write-Host "=== Optimize-FileNames Report Generation ===" -ForegroundColor Cyan
+        Write-Host "Analyzing $totalItems item(s) for report..." -ForegroundColor Yellow
+    } else {
+        Write-Host "=== Optimize-FileNames Starting ===" -ForegroundColor Cyan
+        Write-Host "Analyzing $totalItems item(s) for optimization..." -ForegroundColor Yellow
+        if ($UndoLogPath) {
+            Write-Host "Undo log will be created at: $UndoLogPath" -ForegroundColor DarkGray
+        }
     }
     Write-Host ""
 }
 
-# Helper function to sanitize names (unchanged)
+# Helper function to sanitize names (same as before)
 function Get-SanitizedName {
     param(
         [string]$Name,
         [string]$Extension = ""
     )
     
-    # Start with original name
     $newName = $Name
     
-    # Step 1: Remove metadata if requested
     if ($RemoveMetadata) {
-        $newName = $newName -replace '\([^)]*\)', ''  # Remove (metadata)
-        $newName = $newName -replace '\[[^\]]*\]', ''  # Remove [metadata]
-        $newName = $newName -replace '_\d+x\d+', ''    # Remove _100x100 dimensions
-        $newName = $newName -replace '-\d+x\d+', ''    # Remove -100x100 dimensions
-        $newName = $newName -replace '__+', '_'        # Collapse multiple underscores
-        $newName = $newName -replace '--+', '-'        # Collapse multiple dashes
-        $newName = $newName -replace '[_-]+$', ''      # Remove trailing separators
-        $newName = $newName -replace '^[_-]+', ''      # Remove leading separators
+        $newName = $newName -replace '\([^)]*\)', ''
+        $newName = $newName -replace '\[[^\]]*\]', ''
+        $newName = $newName -replace '_\d+x\d+', ''
+        $newName = $newName -replace '-\d+x\d+', ''
+        $newName = $newName -replace '__+', '_'
+        $newName = $newName -replace '--+', '-'
+        $newName = $newName -replace '[_-]+$', ''
+        $newName = $newName -replace '^[_-]+', ''
     }
     
-    # Step 2: Handle spaces
     switch ($SpaceReplacement) {
         'Remove'     { $newName = $newName -replace '\s+', '' }
         'Dash'       { $newName = $newName -replace '\s+', '-' }
         'Underscore' { $newName = $newName -replace '\s+', '_' }
     }
     
-    # Step 3: Handle ampersands
     if ($ExpandAmpersand) {
         $newName = $newName -replace '&', '_and_'
-        $newName = $newName -replace '_and_+', '_and_'  # Clean up multiple and's
+        $newName = $newName -replace '_and_+', '_and_'
     } else {
         $newName = $newName -replace '&', '_'
     }
     
-    # Step 4: Remove or replace other problematic characters
     foreach ($char in $problematicChars) {
-        if ($char -ne '&') {  # Already handled ampersands above
+        if ($char -ne '&') {
             $escaped = [Regex]::Escape($char)
             if ($char -in @('[',']','(',')')) {
                 $newName = $newName -replace $escaped, '-'
@@ -813,32 +1211,27 @@ function Get-SanitizedName {
         }
     }
     
-    # Step 5: Clean up multiple separators
     $newName = $newName -replace '_{2,}', '_'
     $newName = $newName -replace '-{2,}', '-'
     $newName = $newName -replace '\.{2,}', '.'
     $newName = $newName -replace '^[_.-]+', ''
     $newName = $newName -replace '[_.-]+$', ''
     
-    # Step 6: Handle case conversion
     if (-not $PreserveCase) {
         $newName = $newName.ToLower()
     }
     
-    # Step 7: Handle extension
     $newExt = $Extension
     if ($LowercaseExtensions -and $Extension) {
         $newExt = $Extension.ToLower()
     }
     
-    # Combine name and extension
     if ($Extension) {
         $finalName = "${newName}${newExt}"
     } else {
         $finalName = $newName
     }
     
-    # Ensure we have a valid name
     if ([string]::IsNullOrWhiteSpace($finalName)) {
         $finalName = "unnamed_$(Get-Random -Maximum 9999)"
         if ($Extension) { $finalName += $newExt }
@@ -847,19 +1240,19 @@ function Get-SanitizedName {
     return $finalName
 }
 
-# Process each item
+# Collect all potential changes for analysis/reporting
+$analysisItems = @()
+
 foreach ($item in $itemsToProcess) {
     $itemNum++
-    $operationId++
     
-    # Progress output
-    if (-not $Silent) {
+    if (-not $Silent -and -not $GenerateReport) {
         $percentComplete = [math]::Round(($itemNum / $totalItems) * 100, 0)
         $itemType = if ($item.PSIsContainer) { "Dir" } else { "File" }
         Write-Host ("[{0,3}%] Checking {1}/{2}: [{3}] {4}" -f $percentComplete, $itemNum, $totalItems, $itemType, $item.Name) -ForegroundColor Cyan
     }
     
-    # Get current path (may have been updated if parent was renamed)
+    # Track path updates for child items
     $currentPath = $item.FullName
     foreach ($oldPath in $renamedPaths.Keys | Sort-Object -Property Length -Descending) {
         if ($currentPath.StartsWith($oldPath)) {
@@ -868,22 +1261,17 @@ foreach ($item in $itemsToProcess) {
         }
     }
     
-    # Skip if item no longer exists (parent was renamed)
-    if (-not (Test-Path -LiteralPath $currentPath)) {
+    if (-not $GenerateReport -and -not (Test-Path -LiteralPath $currentPath)) {
         if (-not $Silent) {
             Write-Host "       ⚠ Skipped: Parent directory was renamed" -ForegroundColor Yellow
         }
         continue
     }
     
-    # Get updated item
-    $currentItem = Get-Item -LiteralPath $currentPath
-    
-    # Get original name components
+    $currentItem = if ($GenerateReport) { $item } else { Get-Item -LiteralPath $currentPath }
     $originalName = $currentItem.Name
     $isDirectory = $currentItem.PSIsContainer
     
-    # Get parent directory
     if ($isDirectory) {
         $directory = $currentItem.Parent.FullName
         if (-not $directory) {
@@ -893,7 +1281,6 @@ foreach ($item in $itemsToProcess) {
         $directory = $currentItem.DirectoryName
     }
     
-    # For files, separate name and extension
     if (-not $isDirectory) {
         $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($originalName)
         $extension = [System.IO.Path]::GetExtension($originalName)
@@ -902,117 +1289,192 @@ foreach ($item in $itemsToProcess) {
         $extension = ""
     }
     
-    # Get sanitized name
     $newName = Get-SanitizedName -Name $nameWithoutExt -Extension $extension
-    
-    # Check if rename is needed
-    if ($newName -eq $originalName) {
-        if (-not $Silent) {
-            Write-Host "       ✓ Already optimized" -ForegroundColor Green
-        }
-        continue
-    }
-    
-    # Build the new full path
     $newPath = Join-Path $directory $newName
     
-    # Check if target already exists
-    if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and -not $Force) {
-        if (-not $Silent) {
-            Write-Host "       ⚠ Skipped: Target name already exists: $newName" -ForegroundColor Yellow
-        }
-        $skipped += [PSCustomObject]@{
-            Original = $currentPath
-            Proposed = $newPath
-            Reason = "Target exists"
-        }
-        continue
-    }
-    
-    # Get file info for undo log
-    $fileInfo = Get-Item -LiteralPath $currentPath
-    $lastWriteTime = $fileInfo.LastWriteTimeUtc.ToString('o')
-    $fileSize = if ($isDirectory) { $null } else { $fileInfo.Length }
-    
-    # Create enhanced operation record with undo information
-    $operation = [PSCustomObject]@{
-        # Standard operation log fields
-        Time = (Get-Date).ToString('s')
+    # Create analysis item
+    $analysisItem = @{
         Type = if ($isDirectory) { "Directory" } else { "File" }
-        OriginalPath = $currentPath
-        OriginalName = $originalName
-        NewPath = $newPath
-        NewName = $newName
-        Status = "Pending"
-        Error = ""
+        Path = Split-Path $currentPath -Parent
+        Current = $originalName
+        Before = $originalName
+        After = $newName
+        FullCurrentPath = $currentPath
+        FullNewPath = $newPath
+        NeedsChange = ($newName -ne $originalName)
+        Size = if (-not $isDirectory -and (Test-Path $currentPath)) { $currentItem.Length } else { 0 }
+    }
+    
+    $analysisItems += $analysisItem
+    
+    # If not generating report, continue with actual processing
+    if (-not $GenerateReport) {
+        if ($newName -eq $originalName) {
+            if (-not $Silent) {
+                Write-Host "       ✓ Already optimized" -ForegroundColor Green
+            }
+            continue
+        }
         
-        # Enhanced undo log fields
-        OperationId = $operationId
-        ParentDirectory = $directory
-        LastWriteTime = $lastWriteTime
-        FileSize = $fileSize
-        Dependencies = @()  # Will be filled in later for directories
-    }
-    
-    # Perform rename
-    if ($PSCmdlet.ShouldProcess($currentPath, "Rename to $newName")) {
-        try {
-            # Handle existing file if Force is specified
-            if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and $Force) {
-                if (-not $Silent) {
-                    Write-Host "       ⚠ Overwriting existing: $newName" -ForegroundColor Yellow
+        if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and -not $Force) {
+            if (-not $Silent) {
+                Write-Host "       ⚠ Skipped: Target name already exists: $newName" -ForegroundColor Yellow
+            }
+            $skipped += [PSCustomObject]@{
+                Original = $currentPath
+                Proposed = $newPath
+                Reason = "Target exists"
+            }
+            continue
+        }
+        
+        # Create operation record and perform rename (existing logic)
+        # ... (rest of the existing rename logic stays the same)
+        
+        $fileInfo = Get-Item -LiteralPath $currentPath
+        $lastWriteTime = $fileInfo.LastWriteTimeUtc.ToString('o')
+        $fileSize = if ($isDirectory) { $null } else { $fileInfo.Length }
+        
+        $operationId++
+        $operation = [PSCustomObject]@{
+            Time = (Get-Date).ToString('s')
+            Type = if ($isDirectory) { "Directory" } else { "File" }
+            OriginalPath = $currentPath
+            OriginalName = $originalName
+            NewPath = $newPath
+            NewName = $newName
+            Status = "Pending"
+            Error = ""
+            OperationId = $operationId
+            ParentDirectory = $directory
+            LastWriteTime = $lastWriteTime
+            FileSize = $fileSize
+            Dependencies = @()
+        }
+        
+        if ($PSCmdlet.ShouldProcess($currentPath, "Rename to $newName")) {
+            try {
+                if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and $Force) {
+                    if (-not $Silent) {
+                        Write-Host "       ⚠ Overwriting existing: $newName" -ForegroundColor Yellow
+                    }
+                    Remove-Item -LiteralPath $newPath -Force
                 }
-                Remove-Item -LiteralPath $newPath -Force
+                
+                Rename-Item -LiteralPath $currentPath -NewName $newName -Force:$Force -ErrorAction Stop
+                $operation.Status = "Success"
+                
+                if ($isDirectory) {
+                    $renamedPaths[$currentPath] = $newPath
+                }
+                
+                if (-not $Silent) {
+                    Write-Host "       ✓ Renamed: $originalName → $newName" -ForegroundColor Green
+                }
+            } catch {
+                $operation.Status = "Failed"
+                $operation.Error = $_.Exception.Message
+                $errors += $operation
+                
+                if (-not $Silent) {
+                    Write-Host "       ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+                }
             }
-            
-            # Perform the rename
-            Rename-Item -LiteralPath $currentPath -NewName $newName -Force:$Force -ErrorAction Stop
-            $operation.Status = "Success"
-            
-            # Track renamed directories for updating child paths
-            if ($isDirectory) {
-                $renamedPaths[$currentPath] = $newPath
-            }
-            
+        } else {
+            $operation.Status = "WhatIf"
             if (-not $Silent) {
-                Write-Host "       ✓ Renamed: $originalName → $newName" -ForegroundColor Green
-            }
-        } catch {
-            $operation.Status = "Failed"
-            $operation.Error = $_.Exception.Message
-            $errors += $operation
-            
-            if (-not $Silent) {
-                Write-Host "       ✗ Failed: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "       → Would rename: $originalName → $newName" -ForegroundColor Cyan
             }
         }
-    } else {
-        $operation.Status = "WhatIf"
-        if (-not $Silent) {
-            Write-Host "       → Would rename: $originalName → $newName" -ForegroundColor Cyan
-        }
+        
+        $renameOperations += $operation
     }
-    
-    $renameOperations += $operation
 }
 
-# Create comprehensive undo log
+# Generate report if requested
+if ($GenerateReport) {
+    $changesCount = ($analysisItems | Where-Object { $_.NeedsChange }).Count
+    $noChangeCount = ($analysisItems | Where-Object { -not $_.NeedsChange }).Count
+    $directoriesCount = ($analysisItems | Where-Object { $_.Type -eq "Directory" -and $_.NeedsChange }).Count
+    
+    $timeEstimate = Get-TimeEstimate -FileCount $changesCount -OperationType "FileNameOptimization"
+    
+    # Get warnings
+    $warnings = Get-OperationWarnings -Items $analysisItems -OperationType "FileNameOptimization" -Settings $operationSettings
+    
+    # Create summary
+    $summary = @{
+        "Total Items Analyzed" = $totalItems
+        "Items Needing Changes" = $changesCount
+        "Items Already Optimized" = $noChangeCount
+        "Directories to Rename" = $directoriesCount
+        "Estimated Time" = $timeEstimate
+    }
+    
+    # Generate report
+    $reportTitle = "Filename Optimization Analysis Report"
+    $reportPath = New-HTMLReport -Title $reportTitle -Operation "Optimize-FileNames" -Summary $summary -DetailedItems $analysisItems -Warnings $warnings -Settings $operationSettings -OutputPath $ReportPath
+    
+    if (-not $Silent) {
+        Write-Host ""
+        Write-Host "=== Report Generation Complete ===" -ForegroundColor Green
+        Write-Host "Report saved to: $reportPath" -ForegroundColor Cyan
+        Write-Host "Items analyzed: $totalItems" -ForegroundColor Yellow
+        Write-Host "Items needing changes: $changesCount" -ForegroundColor Yellow
+        
+        if ($warnings.Count -gt 0) {
+            Write-Host "Warnings found: $($warnings.Count)" -ForegroundColor Yellow
+        }
+        
+        Write-Host ""
+        Write-Host "To apply these changes, run the same command without -GenerateReport" -ForegroundColor Gray
+    }
+    
+    return [PSCustomObject]@{
+        TotalItems = $totalItems
+        ItemsNeedingChanges = $changesCount
+        ItemsAlreadyOptimized = $noChangeCount
+        DirectoriesToRename = $directoriesCount
+        EstimatedTime = $timeEstimate
+        WarningCount = $warnings.Count
+        ReportPath = $reportPath
+        AnalysisItems = $analysisItems
+    }
+}
+
+# Continue with existing logic for actual operations...
+# (Undo log creation, standard logging, summary, etc. - same as before)
+
+# Create undo log metadata
+$undoMetadata = @{
+    timestamp = (Get-Date).ToString('o')
+    root_path = (Resolve-Path -LiteralPath $Root).Path
+    settings = @{
+        RemoveMetadata = $RemoveMetadata.IsPresent
+        SpaceReplacement = $SpaceReplacement
+        LowercaseExtensions = $LowercaseExtensions.IsPresent
+        PreserveCase = $PreserveCase.IsPresent
+        ExpandAmpersand = $ExpandAmpersand.IsPresent
+        Force = $Force.IsPresent
+    }
+    powershell_version = $PSVersionTable.PSVersion.ToString()
+    module_version = (Get-Module ConvertVTTAssets).Version.ToString()
+}
+
+# Create comprehensive undo log (same as existing implementation)
 if ($UndoLogPath -and $renameOperations.Count -gt 0) {
     $successfulOps = $renameOperations | Where-Object { $_.Status -eq "Success" }
     
     if ($successfulOps.Count -gt 0) {
-        # Build dependency relationships for directories
         foreach ($op in $successfulOps | Where-Object { $_.Type -eq "Directory" }) {
-            # Find all operations that occurred within this directory
             $dependents = $successfulOps | Where-Object { 
                 $_.OperationId -ne $op.OperationId -and 
-                $_.OriginalPath.StartsWith($op.NewPath)  # Use new path since rename already happened
+                $_.OriginalPath.StartsWith($op.NewPath)
             }
             
             $op.Dependencies = @($dependents | ForEach-Object { $_.OperationId })
         }
         
-# Add total operations to metadata before creating the hash
         $undoMetadata.total_operations = $successfulOps.Count
         
         $undoLog = @{
@@ -1034,13 +1496,11 @@ if ($UndoLogPath -and $renameOperations.Count -gt 0) {
             })
         }
         
-        # Ensure directory exists
         $undoLogDir = [System.IO.Path]::GetDirectoryName($UndoLogPath)
         if ($undoLogDir -and -not (Test-Path $undoLogDir)) {
             New-Item -ItemType Directory -Force -Path $undoLogDir | Out-Null
         }
         
-        # Write undo log
         $undoLog | ConvertTo-Json -Depth 10 | Set-Content -Path $UndoLogPath -Encoding UTF8
         
         if (-not $Silent) {
@@ -1051,7 +1511,7 @@ if ($UndoLogPath -and $renameOperations.Count -gt 0) {
     }
 }
 
-# Write standard log if requested
+# Standard logging and summary (same as existing implementation)
 if ($LogPath) {
     $dir = [System.IO.Path]::GetDirectoryName($LogPath)
     if ($dir -and -not (Test-Path $dir)) {
@@ -1064,13 +1524,7 @@ if ($LogPath) {
         TotalItems = $totalItems
         Operations = $renameOperations
         Skipped = $skipped
-        Settings = @{
-            SpaceReplacement = $SpaceReplacement
-            RemoveMetadata = $RemoveMetadata
-            LowercaseExtensions = $LowercaseExtensions
-            PreserveCase = $PreserveCase
-            ExpandAmpersand = $ExpandAmpersand
-        }
+        Settings = $operationSettings
     }
     
     $ext = [System.IO.Path]::GetExtension($LogPath).ToLower()
@@ -1080,7 +1534,6 @@ if ($LogPath) {
     }
 }
 
-# Summary
 $successful = ($renameOperations | Where-Object { $_.Status -eq "Success" }).Count
 $failed = ($renameOperations | Where-Object { $_.Status -eq "Failed" }).Count
 $whatif = ($renameOperations | Where-Object { $_.Status -eq "WhatIf" }).Count
@@ -1101,7 +1554,6 @@ if ($errors.Count -gt 0) {
     }
 }
 
-# Return summary object
 return [PSCustomObject]@{
     TotalItems = $totalItems
     Renamed = $successful

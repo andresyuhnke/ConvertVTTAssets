@@ -264,31 +264,42 @@ function Invoke-WebPParallel {
 }
 
 # Parallel helper for filename optimization
-
 function Invoke-FileNameOptimizationParallel {
     param(
         [System.IO.FileSystemInfo[]]$Files,  # Only files, directories handled sequentially
         [hashtable]$Settings,
         [hashtable]$RenamedPaths,
-        [ref]$OperationId
+        [ref]$OperationId,
+        [string]$OutputRoot = $null,
+        [string]$RootFull = $null
     )
     
     Import-Module ThreadJob -ErrorAction SilentlyContinue
     Write-Verbose "Engine: ThreadJob (Filename Optimization) | ThrottleLimit=$($Settings.ThrottleLimit)"
     [System.Collections.ArrayList]$jobs = @()
 
-    foreach ($f in $Files) {
+    # Split files into batches for parallel processing (like WebM/WebP functions)
+    $batchSize = [Math]::Max(1, [Math]::Ceiling($Files.Count / [Math]::Max(1, $Settings.ThrottleLimit)))
+    Write-Verbose "Processing $($Files.Count) files in batches of $batchSize"
+    
+    for ($i = 0; $i -lt $Files.Count; $i += $batchSize) {
+        $endIndex = [Math]::Min($i + $batchSize - 1, $Files.Count - 1)
+        $batch = $Files[$i..$endIndex]
+        
         while ($jobs.Count -ge [int]$Settings.ThrottleLimit) {
             if ($jobs.Count -gt 0) { Wait-Job -Job $jobs -Any | Out-Null }
             $jobs = @($jobs | Where-Object { $_.State -eq 'Running' })
         }
 
         $job = Start-ThreadJob -ScriptBlock {
-            param($f, $Settings, $RenamedPaths, $OpId)
+            param($FileBatch, $Settings, $RenamedPaths, $StartingOpId, $OutputRoot, $RootFull)
                         
             $VerbosePreference = $Settings.VerbosePreference
             $WhatIfPreference = $Settings.WhatIfPreference
             $ErrorActionPreference = 'Stop'
+            $useOutputRoot = -not [string]::IsNullOrWhiteSpace($OutputRoot)
+            $results = @()
+            $currentOpId = $StartingOpId
 
             # Create the sanitization function within the job
             function Get-SanitizedName {
@@ -369,106 +380,173 @@ function Invoke-FileNameOptimizationParallel {
                 return $finalName
             }
 
-            # Update file path based on renamed directories
-            $currentPath = $f.FullName
-            foreach ($oldPath in $RenamedPaths.Keys | Sort-Object -Property Length -Descending) {
-                if ($currentPath.StartsWith($oldPath)) {
-                    $currentPath = $currentPath.Replace($oldPath, $RenamedPaths[$oldPath])
-                    break
+            # Process each file in the batch
+            foreach ($f in $FileBatch) {
+                $currentOpId++
+                
+                # Update file path based on renamed directories
+                $currentPath = $f.FullName
+                $originalPath = $f.FullName
+                foreach ($oldPath in $RenamedPaths.Keys | Sort-Object -Property Length -Descending) {
+                    if ($currentPath.StartsWith($oldPath)) {
+                        $currentPath = $currentPath.Replace($oldPath, $RenamedPaths[$oldPath])
+                        Write-Verbose "File path mapped: '$originalPath' -> '$currentPath'"
+                        break
+                    }
                 }
-            }
-            
-            # Skip if file no longer exists (parent was renamed)
-            if (-not (Test-Path -LiteralPath $currentPath)) {
-                return [PSCustomObject]@{
-                    OperationId = $OpId
+                
+                # For OutputRoot operations, we don't skip files just because their path was mapped
+                # The mapped path should still be processed normally
+                if (-not $useOutputRoot -and -not (Test-Path -LiteralPath $currentPath)) {
+                    $results += [PSCustomObject]@{
+                        OperationId = $currentOpId
+                        Type = "File"
+                        OriginalPath = $f.FullName
+                        OriginalName = $f.Name
+                        NewPath = $null
+                        NewName = $null
+                        Status = "Skipped"
+                        Error = "Parent directory was renamed"
+                        Time = (Get-Date).ToString('s')
+                        LastWriteTime = $null
+                        FileSize = $null
+                        ParentDirectory = $null
+                        Dependencies = @()
+                    }
+                    continue
+                }
+                
+                # For OutputRoot operations with mapped paths, use original file info
+                $currentItem = if ($useOutputRoot) {
+                    # Always use original file info for OutputRoot operations
+                    $f
+                } else {
+                    Get-Item -LiteralPath $currentPath
+                }
+                
+                $originalName = $currentItem.Name
+                # Use the mapped directory path if the directory was renamed
+                $directory = $currentItem.DirectoryName
+                foreach ($oldPath in $RenamedPaths.Keys | Sort-Object -Property Length -Descending) {
+                    if ($directory.StartsWith($oldPath)) {
+                        $directory = $directory.Replace($oldPath, $RenamedPaths[$oldPath])
+                        Write-Verbose "Directory path for file mapped: '$($currentItem.DirectoryName)' -> '$directory'"
+                        break
+                    }
+                }
+                
+                $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($originalName)
+                $extension = [System.IO.Path]::GetExtension($originalName)
+                
+                $newName = Get-SanitizedName -Name $nameWithoutExt -Extension $extension
+                
+                # Calculate new path based on OutputRoot if specified
+                if ($useOutputRoot) {
+                    # Calculate relative path from Root to file's directory
+                    $rootUri = New-Object System.Uri(($RootFull + '\'))
+                    $dirUri = New-Object System.Uri(($directory + '\'))
+                    $relUri = $rootUri.MakeRelativeUri($dirUri).ToString()
+                    $relPath = [System.Uri]::UnescapeDataString($relUri) -replace '/', '\'
+                    
+                    $destDir = if ([string]::IsNullOrWhiteSpace($relPath)) { 
+                        $OutputRoot 
+                    } else { 
+                        Join-Path $OutputRoot $relPath 
+                    }
+                    
+                    # Create destination directory if needed
+                    if (-not (Test-Path -LiteralPath $destDir)) {
+                        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+                    }
+                    
+                    $newPath = Join-Path $destDir $newName
+                } else {
+                    $newPath = Join-Path $directory $newName
+                }
+                
+                # Create result object
+                $result = [PSCustomObject]@{
+                    OperationId = $currentOpId
                     Type = "File"
                     OriginalPath = $f.FullName
-                    OriginalName = $f.Name
-                    NewPath = $null
-                    NewName = $null
+                    OriginalName = $originalName
+                    NewPath = $newPath
+                    NewName = $newName
                     Status = "Skipped"
-                    Error = "Parent directory was renamed"
+                    Error = ""
                     Time = (Get-Date).ToString('s')
-                    LastWriteTime = $null
-                    FileSize = $null
-                    ParentDirectory = $null
+                    LastWriteTime = $currentItem.LastWriteTimeUtc.ToString('o')
+                    FileSize = $currentItem.Length
+                    ParentDirectory = $directory
                     Dependencies = @()
                 }
-            }
-            
-            $currentItem = Get-Item -LiteralPath $currentPath
-            $originalName = $currentItem.Name
-            $directory = $currentItem.DirectoryName
-            
-            $nameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($originalName)
-            $extension = [System.IO.Path]::GetExtension($originalName)
-            
-            $newName = Get-SanitizedName -Name $nameWithoutExt -Extension $extension
-            
-            # Create result object
-            $result = [PSCustomObject]@{
-                OperationId = $OpId
-                Type = "File"
-                OriginalPath = $currentPath
-                OriginalName = $originalName
-                NewPath = (Join-Path $directory $newName)
-                NewName = $newName
-                Status = "Skipped"
-                Error = ""
-                Time = (Get-Date).ToString('s')
-                LastWriteTime = $currentItem.LastWriteTimeUtc.ToString('o')
-                FileSize = $currentItem.Length
-                ParentDirectory = $directory
-                Dependencies = @()
-            }
-            
-            # Check if rename is needed
-            if ($newName -eq $originalName) {
-                $result.Status = "AlreadyOptimized"
-                return $result
-            }
-            
-            $newPath = Join-Path $directory $newName
-            $result.NewPath = $newPath
-            
-            # Check for conflicts
-            if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and -not $Settings.Force) {
-                $result.Status = "Skipped"
-                $result.Error = "Target already exists"
-                return $result
-            }
-            
-            # Perform rename operation
-            if ($WhatIfPreference) {
-                $result.Status = "WhatIf"
-                return $result
-            }
-            
-            try {
-                if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and $Settings.Force) {
-                    Remove-Item -LiteralPath $newPath -Force
+                
+                # Check if rename is needed
+                if ($newName -eq $originalName) {
+                    $result.Status = "AlreadyOptimized"
+                    $results += $result
+                    continue
                 }
                 
-                Rename-Item -LiteralPath $currentPath -NewName $newName -Force:$Settings.Force -ErrorAction Stop
-                $result.Status = "Success"
+                # Check for conflicts
+                if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and -not $Settings.Force) {
+                    $result.Status = "Skipped"
+                    $result.Error = "Target already exists"
+                    $results += $result
+                    continue
+                }
                 
-                return $result
-            } catch {
-                $result.Status = "Failed"
-                $result.Error = $_.Exception.Message
-                return $result
+                # Perform operation
+                if ($WhatIfPreference) {
+                    $result.Status = "WhatIf"
+                    $results += $result
+                    continue
+                }
+                
+                try {
+                    if ($useOutputRoot) {
+                        # Copy file to new location with new name
+                        Copy-Item -LiteralPath $f.FullName -Destination $newPath -Force:$Settings.Force
+                        $result.Status = "Success"
+                    } else {
+                        # Original rename logic for in-place operation
+                        if ((Test-Path -LiteralPath $newPath) -and ($currentPath -ne $newPath) -and $Settings.Force) {
+                            Remove-Item -LiteralPath $newPath -Force
+                        }
+                        
+                        Rename-Item -LiteralPath $currentPath -NewName $newName -Force:$Settings.Force -ErrorAction Stop
+                        $result.Status = "Success"
+                    }
+                    
+                    $results += $result
+                } catch {
+                    $result.Status = "Failed"
+                    $result.Error = $_.Exception.Message
+                    $results += $result
+                }
             }
-        } -ArgumentList $f, $Settings, $RenamedPaths, $OperationId.Value
+            
+            return $results
+        } -ArgumentList $batch, $Settings, $RenamedPaths, $OperationId.Value, $OutputRoot, $RootFull
         
-        $OperationId.Value++
+        # Update operation ID for next batch
+        $OperationId.Value += $batch.Count
         $jobs += $job
     }
 
     if ($jobs.Count -gt 0) {
         Wait-Job -Job $jobs | Out-Null
+        $allResults = @()
         $results = Receive-Job -Job $jobs -AutoRemoveJob -Wait
-        return $results
+        # Flatten results from all batches
+        foreach ($result in $results) {
+            if ($result -is [array]) {
+                $allResults += $result
+            } else {
+                $allResults += $result
+            }
+        }
+        return $allResults
     } else {
         return @()
     }
